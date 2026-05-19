@@ -702,6 +702,93 @@ export function normalizeNotification(state, message) {
         raw: params.turn ?? null
       };
     }
+    case "turn/plan/updated": {
+      // codex 0.131 emits this when its internal plan/todo list mutates.
+      // Wire shape: { threadId, turnId, explanation: string|null,
+      // plan: [{ step: string, status: "completed"|"inProgress"|"pending"|... }] }.
+      // Phase = thinking (codex is re-planning, not executing).
+      const plan = Array.isArray(params.plan) ? params.plan : [];
+      let completed = 0;
+      let inProgress = 0;
+      let pending = 0;
+      for (const step of plan) {
+        const s = step?.status;
+        if (s === "completed") completed += 1;
+        else if (s === "inProgress") inProgress += 1;
+        else if (s === "pending") pending += 1;
+      }
+      const parts = [];
+      if (completed > 0) parts.push(`${completed} done`);
+      if (inProgress > 0) parts.push(`${inProgress} in progress`);
+      if (pending > 0) parts.push(`${pending} pending`);
+      const summary = parts.length > 0 ? `: ${parts.join(", ")}` : "";
+      const threadId = params.threadId ?? null;
+      return {
+        ts,
+        method,
+        threadId,
+        turnId:
+          params.turnId ?? state.threadTurnIds.get(threadId ?? state.threadId) ?? null,
+        itemType: null,
+        lifecycle: null,
+        phase: "thinking",
+        message:
+          plan.length > 0
+            ? `Plan updated (${plan.length} step${plan.length === 1 ? "" : "s"}${summary}).`
+            : "Plan updated.",
+        raw: params
+      };
+    }
+    case "turn/diff/updated": {
+      // codex streams the running unified-diff as it edits files. Surfacing
+      // editing phase lets the main loop treat this as "files in flight" the
+      // same way it treats fileChange items. raw.diff is preserved so
+      // consumers can render the full patch.
+      const diff = typeof params.diff === "string" ? params.diff : null;
+      const fileMatches = diff ? diff.match(/^diff --git /gm) : null;
+      const fileCount = fileMatches ? fileMatches.length : 0;
+      const threadId = params.threadId ?? null;
+      return {
+        ts,
+        method,
+        threadId,
+        turnId:
+          params.turnId ?? state.threadTurnIds.get(threadId ?? state.threadId) ?? null,
+        itemType: null,
+        lifecycle: null,
+        phase: "editing",
+        message:
+          fileCount > 0
+            ? `Diff updated (${fileCount} file${fileCount === 1 ? "" : "s"}).`
+            : "Diff updated.",
+        raw: params
+      };
+    }
+    case "item/commandExecution/outputDelta": {
+      // codex 0.131 streams stdout chunks while a commandExecution item is
+      // still running. Wire shape: { threadId, turnId, itemId, delta: string,
+      // stream: null }. We surface byte count (delta payloads can be huge —
+      // observed up to 638 bytes per event in a 56s task) but keep the raw
+      // chunk so consumers that want full stdout can join them in order.
+      const delta = typeof params.delta === "string" ? params.delta : "";
+      const len = delta.length;
+      const threadId = params.threadId ?? null;
+      return {
+        ts,
+        method,
+        threadId,
+        turnId:
+          params.turnId ?? state.threadTurnIds.get(threadId ?? state.threadId) ?? null,
+        itemType: "commandExecution",
+        lifecycle: "delta",
+        phase: "running",
+        message:
+          len > 0
+            ? `Command output +${len} byte${len === 1 ? "" : "s"}.`
+            : "Command output delta.",
+        raw: params
+      };
+    }
     default:
       return {
         ts,
