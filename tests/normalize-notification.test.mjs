@@ -361,3 +361,139 @@ test("normalizeNotification: item/completed agentMessage with content[].text sho
   assert.equal(event.phase, "thinking");
   assert.match(event.message, /Codex replied: Final answer: 42/);
 });
+
+test("normalizeNotification: turn/plan/updated -> thinking phase with step summary", () => {
+  // Wire-observed schema from codex 0.131: { threadId, turnId, explanation:
+  // null, plan: [{ step, status }] }. Status values seen in the wild include
+  // "completed", "inProgress", "pending".
+  const event = normalizeNotification(makeState(), {
+    method: "turn/plan/updated",
+    params: {
+      threadId: "thr_main",
+      turnId: "trn_001",
+      explanation: null,
+      plan: [
+        { step: "确认仓库现状和约束", status: "completed" },
+        { step: "实现带类型提示/docstring 的 Trie", status: "inProgress" },
+        { step: "补 pytest 覆盖指定场景", status: "pending" },
+        { step: "运行 pytest 验证", status: "pending" }
+      ]
+    }
+  });
+
+  assert.equal(event.method, "turn/plan/updated");
+  assert.equal(event.phase, "thinking");
+  assert.equal(event.threadId, "thr_main");
+  assert.equal(event.turnId, "trn_001");
+  assert.equal(event.itemType, null);
+  assert.equal(event.lifecycle, null);
+  assert.match(event.message, /Plan updated/);
+  assert.match(event.message, /4 steps/);
+  assert.match(event.message, /1 done/);
+  assert.match(event.message, /1 in progress/);
+  assert.match(event.message, /2 pending/);
+  // raw preserves the full plan so main-loop Claude can render step contents
+  assert.equal(event.raw.plan.length, 4);
+});
+
+test("normalizeNotification: turn/plan/updated without plan array yields generic message", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "turn/plan/updated",
+    params: { threadId: "thr_main", turnId: "trn_001" }
+  });
+
+  assert.equal(event.phase, "thinking");
+  assert.match(event.message, /Plan updated/);
+});
+
+test("normalizeNotification: turn/plan/updated falls back to state.threadTurnIds when params.turnId absent", () => {
+  // Defensive: covers older/future codex builds that may omit turnId from
+  // plan-update notifications. We've already registered the active turn via
+  // turn/started, so the normalizer should still surface it.
+  const state = makeState();
+  state.threadTurnIds.set("thr_main", "trn_inferred");
+  const event = normalizeNotification(state, {
+    method: "turn/plan/updated",
+    params: { threadId: "thr_main", plan: [{ step: "x", status: "pending" }] }
+  });
+
+  assert.equal(event.turnId, "trn_inferred");
+});
+
+test("normalizeNotification: turn/diff/updated -> editing phase with file count", () => {
+  // Wire-observed: raw.diff is a unified-diff string. Count files by
+  // matching `^diff --git ` headers — observed in real codex 0.131 traces
+  // when codex was creating test_trie.py alongside trie.py.
+  const diff =
+    "diff --git a/trie.py b/trie.py\nnew file mode 100644\n--- /dev/null\n+++ b/trie.py\n@@ -0,0 +1,5 @@\n+class Trie:\n+    pass\n" +
+    "diff --git a/test_trie.py b/test_trie.py\nnew file mode 100644\n--- /dev/null\n+++ b/test_trie.py\n@@ -0,0 +1,3 @@\n+from trie import Trie\n";
+  const event = normalizeNotification(makeState(), {
+    method: "turn/diff/updated",
+    params: {
+      threadId: "thr_main",
+      turnId: "trn_001",
+      diff
+    }
+  });
+
+  assert.equal(event.method, "turn/diff/updated");
+  assert.equal(event.phase, "editing");
+  assert.equal(event.threadId, "thr_main");
+  assert.equal(event.turnId, "trn_001");
+  assert.equal(event.itemType, null);
+  assert.match(event.message, /Diff updated/);
+  assert.match(event.message, /2 files/);
+  // raw preserves the full diff string for downstream patch rendering
+  assert.equal(event.raw.diff, diff);
+});
+
+test("normalizeNotification: turn/diff/updated without diff string yields generic message", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "turn/diff/updated",
+    params: { threadId: "thr_main", turnId: "trn_001" }
+  });
+
+  assert.equal(event.phase, "editing");
+  assert.match(event.message, /Diff updated/);
+  // No file count when diff missing
+  assert.doesNotMatch(event.message, /file/);
+});
+
+test("normalizeNotification: item/commandExecution/outputDelta -> running phase with byte count", () => {
+  // Wire-observed: codex 0.131 streams stdout chunks during a running
+  // commandExecution item. params = { threadId, turnId, itemId, delta,
+  // stream: null }. Phase stays "running" because the command hasn't finished
+  // — this is a progress signal, not a lifecycle transition.
+  const event = normalizeNotification(makeState(), {
+    method: "item/commandExecution/outputDelta",
+    params: {
+      threadId: "thr_main",
+      turnId: "trn_001",
+      itemId: "call_JbBZeYtNazPjdT6f76bR8adX",
+      delta: "hello world\n",
+      stream: null
+    }
+  });
+
+  assert.equal(event.method, "item/commandExecution/outputDelta");
+  assert.equal(event.phase, "running");
+  assert.equal(event.itemType, "commandExecution");
+  assert.equal(event.lifecycle, "delta");
+  assert.equal(event.threadId, "thr_main");
+  assert.equal(event.turnId, "trn_001");
+  assert.match(event.message, /Command output \+12 bytes/);
+  // raw preserves the chunk so consumers can join deltas in seq order
+  assert.equal(event.raw.delta, "hello world\n");
+  assert.equal(event.raw.itemId, "call_JbBZeYtNazPjdT6f76bR8adX");
+});
+
+test("normalizeNotification: item/commandExecution/outputDelta with empty delta still surfaces running phase", () => {
+  const event = normalizeNotification(makeState(), {
+    method: "item/commandExecution/outputDelta",
+    params: { threadId: "thr_main", turnId: "trn_001", itemId: "call_x", delta: "" }
+  });
+
+  assert.equal(event.phase, "running");
+  assert.equal(event.itemType, "commandExecution");
+  assert.match(event.message, /Command output delta/);
+});

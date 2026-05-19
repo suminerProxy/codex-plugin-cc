@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.2.1
+
+Schema-coverage patch. Long write-tasks under 1.2.0 (56s+ runs that edit
+files and execute commands) exposed three codex 0.131 notification methods
+that `normalizeNotification` did not recognise. The events stream stayed
+correct — raw payloads were preserved untouched, so consumers could still
+read everything from `raw.delta` / `raw.diff` / `raw.plan` — but the
+normalised `phase` defaulted to `unknown`, hiding useful signal from
+main-loop Claude. This release maps each of them to a real phase and
+adds a useful `message` summary while keeping the raw shape intact.
+
+- **`turn/plan/updated` → `phase: "thinking"`**: codex emits this when
+  its internal plan/todo list mutates. Wire shape:
+  `{ threadId, turnId, explanation: string|null, plan: [{ step, status }] }`
+  where status ∈ `{completed, inProgress, pending, ...}`. The normalised
+  message reports `Plan updated (N steps: X done, Y in progress, Z pending)`
+  so the events stream is self-describing without consulting `raw`.
+- **`turn/diff/updated` → `phase: "editing"`**: codex streams the running
+  unified-diff while editing files (a precursor to the final `fileChange`
+  item). Wire shape: `{ threadId, turnId, diff: string }`. The normalised
+  message counts unified-diff file headers (`diff --git`) and reports
+  `Diff updated (N files)`. `raw.diff` is preserved verbatim for patch
+  rendering.
+- **`item/commandExecution/outputDelta` → `phase: "running"`**: codex
+  streams stdout chunks while a `commandExecution` item is still running.
+  Wire shape: `{ threadId, turnId, itemId, delta: string, stream: null }`
+  (the 0.131 build has not started distinguishing stdout vs stderr — all
+  observed `stream` values are `null`). The normalised event is tagged
+  `itemType: "commandExecution"`, `lifecycle: "delta"`, and reports
+  `Command output +N bytes`. Full `delta` is preserved in `raw` so
+  consumers can join chunks in `seq` order to reconstruct full stdout.
+- **`turnId` fallback**: all three normalisers prefer `params.turnId`
+  but fall back to `state.threadTurnIds.get(threadId)` for forward-compat
+  with future codex builds that may omit `turnId` from these specific
+  notifications.
+- **Coverage**: `normalizeNotification` now recognises every distinct
+  method observed in real codex 0.131 traces from the 1.2.0 push-mode
+  E2E runs.
+
+Tests: 7 new cases in `tests/normalize-notification.test.mjs` covering
+each new method (happy path + fallback path), wire-observed payloads
+copied verbatim from a real 56s task trace. 156/156 pass.
+
 ## 1.2.0
 
 Push-mode delivery for the main Claude loop. 1.1.x exposed the per-job
