@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.1.1
+
+Follow-up to 1.1.0 closing gaps identified during post-merge verification.
+
+- **Criterion #4 finally landed end-to-end**: 1.1.0 promised
+  `token usage in /codex:status output + events stream` but only the
+  events stream half worked. The verification round found three gaps:
+  `runAppServerTurn` returned `usage: turnState.finalTurn?.usage` but
+  codex 0.131 doesn't put usage on the turn payload — only in
+  `thread/tokenUsage/updated` notifications. `executeTaskRun` dropped
+  `usage` from the stored job payload. And `renderJobStatusReport`
+  had no Tokens line. All three fixed:
+  - `captureTurn` state now accumulates `tokenUsage` from
+    notifications. `applyTurnNotification` handles
+    `thread/tokenUsage/updated` and stores `params.usage ??
+    params.tokenUsage ?? params` as the latest value (codex emits
+    cumulative totals, so each update replaces the previous).
+  - `runAppServerTurn.usage` now returns the accumulator and falls
+    back to `finalTurn?.usage` for forward-compat with future codex
+    versions.
+  - `executeTaskRun` includes `usage` in the persisted payload.
+  - `renderJobStatusReport` shows `Tokens: in=N out=N [cached=N]`
+    when usage is present. Field-name probing walks
+    `usage.total → usage.last → usage` then `.inputTokens / .input`,
+    `.outputTokens / .output`, `.cachedInputTokens / .cached /
+    .cachedTokens`. Real codex 0.131 nests counts under
+    `{ tokenUsage: { total: {...}, last: {...},
+    modelContextWindow: N } }` (discovered via E2E spike).
+
+- **Stall watchdog gains regression coverage**: 1.1.0 verified the
+  watchdog manually (stallMs=8540 in a real codex run). 1.1.1 adds an
+  integration test in `tests/stuck-watchdog.test.mjs` that spawns a
+  background task against a fake codex configured to hang after
+  `turn/start` (new fake-codex behavior
+  `hang-after-turn-start`), waits for the worker's setInterval to
+  detect the silence, and asserts the events stream contains
+  `{type:"watchdog", phase:"stuck"}` with `stallMs >= threshold`.
+  Test runs ~6 seconds, stable across consecutive runs.
+
+- **`CODEX_EVENTS_RAW=0` to disable raw payloads**: long sessions can
+  grow the events.ndjson file quickly because the `raw` field carries
+  full notification payloads. Setting this env var strips `raw` at
+  the `appendJobEvent` layer (state-layer policy; `normalizeNotification`
+  itself remains a pure transform that always produces `raw`).
+  Default behavior unchanged.
+
+- **`thread/compact/start` schema confirmed**: codex 0.131 returns
+  `{}` (empty object) on successful compaction — compaction is fully
+  async and status updates flow via subsequent notifications. The
+  wrapper continues to preserve `result` verbatim for forward-compat.
+
 ## 1.1.0
 
 Observability rework for the main-loop orchestration case: the consumer of
