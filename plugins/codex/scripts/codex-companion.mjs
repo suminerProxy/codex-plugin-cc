@@ -82,6 +82,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task-stream [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs events <job-id> [--since <iso>] [--after-seq <n>] [--limit <n>] [--json]",
       "  node scripts/codex-companion.mjs compact <thread-id> [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -804,6 +805,144 @@ async function handleTask(argv) {
   );
 }
 
+async function handleTaskStream(argv) {
+  // Foreground push-mode task. The main Claude loop wraps this with the
+  // Monitor tool so each NDJSON line written to stdout becomes a push
+  // notification — no polling needed. Events are still persisted to
+  // {stateDir}/jobs/{jobId}.events.ndjson so /codex:events and /codex:result
+  // continue to work after the stream ends or the consumer reconnects.
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    booleanOptions: ["write", "resume-last", "resume", "fresh"],
+    aliasMap: { m: "model" }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const prompt = readTaskPrompt(cwd, options, positionals);
+
+  const resumeLast = Boolean(options["resume-last"] || options.resume);
+  const fresh = Boolean(options.fresh);
+  if (resumeLast && fresh) {
+    throw new Error("Choose either --resume/--resume-last or --fresh.");
+  }
+  const write = Boolean(options.write);
+
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast);
+
+  const taskMetadata = buildTaskRunMetadata({ prompt, resumeLast });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const jobId = job.id;
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    jobId
+  });
+
+  // Reuse the existing job-tracking machinery for log file + central
+  // state.json transitions. stderr=false so codex progress text doesn't
+  // pollute the stdout NDJSON stream that Monitor is consuming.
+  const { logFile } = createTrackedProgress(
+    { ...job, workspaceRoot },
+    { stderr: false }
+  );
+
+  // Same closure pattern as handleTaskWorker: `seq` + `lastEventAt` shared
+  // between onNotification and the stall watchdog. Single-process, no IPC.
+  let seq = 0;
+  let lastEventAt = Date.now();
+  let lastEmittedPhase = null;
+
+  const stallSecondsRaw = Number(process.env.CODEX_COMPANION_STALL_SECONDS);
+  const stallSeconds =
+    Number.isFinite(stallSecondsRaw) && stallSecondsRaw > 0 ? stallSecondsRaw : 60;
+
+  const emit = (event) => {
+    const enriched = { seq: seq++, ...event };
+    try {
+      appendJobEvent(workspaceRoot, jobId, enriched);
+    } catch {
+      // file-write errors must not break the stdout push (and vice versa)
+    }
+    lastEventAt = Date.now();
+    if (enriched.phase && enriched.phase !== lastEmittedPhase) {
+      lastEmittedPhase = enriched.phase;
+      try {
+        upsertJob(workspaceRoot, {
+          id: jobId,
+          phase: enriched.phase,
+          lastEventAt: enriched.ts
+        });
+      } catch {
+        // ignored
+      }
+    }
+    try {
+      process.stdout.write(`${JSON.stringify({ jobId, ...enriched })}\n`);
+    } catch {
+      // stdout closed by consumer (Monitor exit, broken pipe) — keep going;
+      // events still land in the on-disk ndjson for later /codex:events.
+    }
+  };
+
+  const watchdog = setInterval(() => {
+    const elapsedMs = Date.now() - lastEventAt;
+    if (elapsedMs <= stallSeconds * 1000) return;
+    emit({
+      ts: new Date().toISOString(),
+      type: "watchdog",
+      phase: "stuck",
+      stallMs: elapsedMs,
+      since: new Date(lastEventAt).toISOString()
+    });
+  }, 5000);
+  watchdog.unref?.();
+
+  let execution = null;
+  let workerError = null;
+  try {
+    execution = await runTrackedJob(
+      { ...job, workspaceRoot, logFile, request },
+      () =>
+        executeTaskRun({
+          ...request,
+          onNotification: emit
+        }),
+      { logFile }
+    );
+  } catch (error) {
+    workerError = error;
+  } finally {
+    clearInterval(watchdog);
+    // Same terminal-event contract as the detached worker path: main-loop
+    // Claude looks for {type:"job/exited"} as the sole authoritative end-
+    // of-job signal. Status (success/failed) comes from execution.exitStatus,
+    // not from whether runTrackedJob threw.
+    const success = !workerError && execution?.exitStatus === 0;
+    emit({
+      ts: new Date().toISOString(),
+      type: "job/exited",
+      phase: success ? "completed" : "failed",
+      exitCode: success ? 0 : execution?.exitStatus ?? 1,
+      errorMessage: workerError
+        ? workerError instanceof Error
+          ? workerError.message
+          : String(workerError)
+        : success
+          ? null
+          : "Task did not complete successfully (see prior events for details)."
+    });
+  }
+  if (workerError) throw workerError;
+}
+
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
@@ -1200,6 +1339,9 @@ async function main() {
       break;
     case "task-worker":
       await handleTaskWorker(argv);
+      break;
+    case "task-stream":
+      await handleTaskStream(argv);
       break;
     case "events":
       await handleEvents(argv);
