@@ -533,6 +533,13 @@ rl.on("line", (line) => {
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
+	        } else if (BEHAVIOR === "hang-after-turn-start") {
+	          // Deliberately silent: respond to the turn/start request (already
+	          // done above) but never send turn/started, item/*, or turn/completed
+	          // notifications. The shared app-server stays quiet so the worker's
+	          // stall watchdog observes lastEventAt grow stale and emits
+	          // {type:"watchdog", phase:"stuck"}. The worker stays alive until
+	          // cancelled by the test (terminateProcessTree on the worker pid).
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
