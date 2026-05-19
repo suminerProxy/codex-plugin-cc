@@ -135,6 +135,26 @@ function pushJobDetails(lines, job, options = {}) {
   if (options.showDuration && job.duration) {
     lines.push(`  Duration: ${job.duration}`);
   }
+  // Surface token usage from either the upserted state (job.usage) or the
+  // full stored payload (job.result?.usage). Real codex 0.131 nests counts
+  // under `total` (cumulative across turns) and `last` (most recent turn);
+  // we prefer `total` so /codex:status reflects the running totals, and fall
+  // back to flat / aliased shapes for forward + backward compat.
+  const rawUsage = job.usage ?? job.result?.usage ?? null;
+  if (rawUsage && typeof rawUsage === "object") {
+    const counts = rawUsage.total ?? rawUsage.last ?? rawUsage;
+    const inTok = counts?.inputTokens ?? counts?.input ?? null;
+    const outTok = counts?.outputTokens ?? counts?.output ?? null;
+    const cachedTok =
+      counts?.cachedInputTokens ?? counts?.cached ?? counts?.cachedTokens ?? null;
+    const parts = [];
+    if (inTok != null) parts.push(`in=${inTok}`);
+    if (outTok != null) parts.push(`out=${outTok}`);
+    if (cachedTok != null) parts.push(`cached=${cachedTok}`);
+    if (parts.length > 0) {
+      lines.push(`  Tokens: ${parts.join(" ")}`);
+    }
+  }
   if (job.threadId) {
     lines.push(`  Codex session ID: ${job.threadId}`);
   }
