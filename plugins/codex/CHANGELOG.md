@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.2.0
+
+Push-mode delivery for the main Claude loop. 1.1.x exposed the per-job
+event stream as a pull contract (`/codex:events <id> --since N`). 1.2.0
+adds a push contract for sessions where the main loop wants real-time
+notification of each codex notification without a poll loop.
+
+- **`/codex:stream <prompt>`** (new): runs codex in foreground push mode.
+  Each notification is written as one NDJSON line to stdout in the form
+  `{"jobId":"task-...","seq":N,"ts":"...","method":"...","phase":"...",
+  "message":"..."}`. Designed for the main Claude loop to wrap with
+  `Monitor({command: "node ... task-stream ..."})` — each NDJSON line
+  becomes a push notification, stream ends on `{type:"job/exited"}`.
+- **`task-stream` subcommand** in codex-companion: foreground execution
+  that shares the `runTrackedJob` + `executeTaskRun` + `appendJobEvent`
+  pipeline with the existing background path. Events are still persisted
+  to `{stateDir}/jobs/{jobId}.events.ndjson`, so `/codex:events <id>` and
+  `/codex:result <id>` keep working after the stream ends or a consumer
+  reconnects from another Claude Code session.
+- **Equivalent disk contract**: `/codex:stream` and
+  `/codex:rescue` + `/codex:events` produce the same `events.ndjson`
+  bytes. Pick by delivery ergonomics (push vs pull), not by capability.
+- Stall watchdog and `{type:"job/exited"}` terminal-event semantics
+  identical to the background path.
+
+Tests: new `tests/task-stream.test.mjs` integration test spawns
+`task-stream` against fake codex, asserts each stdout line is valid
+NDJSON with monotonic `seq`, the same `jobId` across all lines, and a
+terminal `job/exited` record matching `events.ndjson` on disk.
+149/149 pass.
+
 ## 1.1.1
 
 Follow-up to 1.1.0 closing gaps identified during post-merge verification.

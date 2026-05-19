@@ -85,7 +85,8 @@ test("continue is not exposed as a user-facing command", () => {
     "result.md",
     "review.md",
     "setup.md",
-    "status.md"
+    "status.md",
+    "stream.md"
   ]);
 });
 
