@@ -4,6 +4,14 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Isolate tests from host-runtime plugin env vars. Claude Code (and similar
+// plugin hosts) injects CLAUDE_PLUGIN_DATA and CODEX_COMPANION_SESSION_ID into
+// the plugin process; if those leak into `npm test`, fallback-path assertions
+// (e.g. `resolveStateDir uses a temp-backed per-workspace directory`) fail.
+// Tests that need these vars set them explicitly with try/finally.
+delete process.env.CLAUDE_PLUGIN_DATA;
+delete process.env.CODEX_COMPANION_SESSION_ID;
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
