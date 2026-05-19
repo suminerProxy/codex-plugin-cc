@@ -174,7 +174,11 @@ export async function runTrackedJob(job, runner, options = {}) {
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
-      completedAt
+      completedAt,
+      // Mirror usage into the top-level job state so /codex:status can show
+      // a Tokens line without loading the full per-job file. May be null when
+      // the upstream codex CLI did not stream tokenUsage events.
+      usage: execution.payload?.usage ?? null
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;

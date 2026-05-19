@@ -517,7 +517,12 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    // Persist usage in the stored job record so /codex:status and
+    // /codex:result can surface a Tokens line without re-running the turn.
+    // Null when the upstream codex CLI did not emit any token usage events
+    // (e.g. very short turns or unsupported provider).
+    usage: result.usage ?? null
   };
 
   return {

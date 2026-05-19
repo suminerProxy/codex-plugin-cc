@@ -333,7 +333,7 @@ function describeCompletedItem(state, item) {
 }
 
 /** @returns {TurnCaptureState} */
-function createTurnCaptureState(threadId, options = {}) {
+export function createTurnCaptureState(threadId, options = {}) {
   let resolveCompletion;
   let rejectCompletion;
   const completion = new Promise((resolve, reject) => {
@@ -365,6 +365,12 @@ function createTurnCaptureState(threadId, options = {}) {
     messages: [],
     fileChanges: [],
     commandExecutions: [],
+    // codex 0.131 doesn't put usage on the turn payload — it streams it
+    // separately via thread/tokenUsage/updated notifications. We accumulate
+    // the latest snapshot here so runAppServerTurn can surface a top-level
+    // `usage` field. Replaces (not sums) on each update because codex
+    // emits cumulative totals.
+    tokenUsage: null,
     onProgress: options.onProgress ?? null
   };
 }
@@ -586,15 +592,17 @@ export function normalizeNotification(state, message) {
       };
     }
     case "thread/tokenUsage/updated": {
-      // codex streams token usage updates as the turn progresses. P7
-      // top-level surface (runAppServerTurn.usage) reads from
-      // turnState.finalTurn?.usage at turn end; this event source is the
-      // real-time signal main-loop Claude can poll to detect "this turn
-      // is burning a lot of tokens, maybe compact before it overflows."
+      // codex streams token usage updates as the turn progresses. Real codex
+      // 0.131 sends `{ tokenUsage: { total: {...}, last: {...},
+      // modelContextWindow: N } }` where inputTokens/outputTokens/cachedInputTokens
+      // are nested under `total` and `last`. We surface `total` (cumulative)
+      // because that's what main-loop Claude needs to gauge "this turn is
+      // burning a lot of tokens, maybe compact before it overflows."
       const usage = params.usage ?? params.tokenUsage ?? params ?? {};
-      const inTok = usage.inputTokens ?? usage.input ?? null;
-      const outTok = usage.outputTokens ?? usage.output ?? null;
-      const cachedTok = usage.cachedInputTokens ?? usage.cached ?? null;
+      const counts = usage?.total ?? usage?.last ?? usage ?? {};
+      const inTok = counts?.inputTokens ?? counts?.input ?? null;
+      const outTok = counts?.outputTokens ?? counts?.output ?? null;
+      const cachedTok = counts?.cachedInputTokens ?? counts?.cached ?? null;
       const parts = [];
       if (inTok != null) parts.push(`in=${inTok}`);
       if (outTok != null) parts.push(`out=${outTok}`);
@@ -709,7 +717,7 @@ export function normalizeNotification(state, message) {
   }
 }
 
-function applyTurnNotification(state, message) {
+export function applyTurnNotification(state, message) {
   switch (message.method) {
     case "thread/started":
       registerThread(state, message.params.thread.id, {
@@ -723,6 +731,16 @@ function applyTurnNotification(state, message) {
       registerThread(state, message.params.threadId, {
         threadName: message.params.threadName ?? null
       });
+      break;
+    case "thread/tokenUsage/updated":
+      // codex emits cumulative totals (not deltas), so each update replaces
+      // the previous value rather than summing. Try multiple field names
+      // since the 0.131 schema is undocumented: `params.usage` is the
+      // observed shape in the wire trace, `params.tokenUsage` is the
+      // event-source naming convention, and the whole `params` is a
+      // last-resort fallback for future codex versions that flatten it.
+      state.tokenUsage =
+        message.params?.usage ?? message.params?.tokenUsage ?? message.params ?? null;
       break;
     case "turn/started":
       registerThread(state, message.params.threadId);
@@ -1329,9 +1347,12 @@ export async function runAppServerTurn(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       // Top-level surface so /codex:status and the events stream can read
-      // usage without traversing the nested `turn` object. May be null when
-      // the upstream codex CLI version does not report usage.
-      usage: turnState.finalTurn?.usage ?? null,
+      // usage without traversing the nested `turn` object. Primary source is
+      // the tokenUsage accumulator (codex 0.131 streams updates via
+      // thread/tokenUsage/updated notifications). The finalTurn?.usage
+      // fallback preserves forward-compat with future codex versions that
+      // attach usage to the turn payload.
+      usage: turnState.tokenUsage ?? turnState.finalTurn?.usage ?? null,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,

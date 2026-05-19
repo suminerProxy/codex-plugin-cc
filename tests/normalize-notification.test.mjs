@@ -303,6 +303,37 @@ test("normalizeNotification: thread/tokenUsage/updated without usage still yield
   assert.match(event.message, /Token usage updated/i);
 });
 
+test("normalizeNotification: thread/tokenUsage/updated decodes real codex 0.131 nested tokenUsage payload", () => {
+  // Wire-observed: codex-cli 0.131.0-alpha.9 wraps counts inside
+  // params.tokenUsage.total. Verify the message string surfaces the cumulative
+  // totals (in/out/cached) so the events stream is useful to main-loop Claude.
+  const event = normalizeNotification(makeState(), {
+    method: "thread/tokenUsage/updated",
+    params: {
+      threadId: "thr_main",
+      turnId: "trn_001",
+      tokenUsage: {
+        total: {
+          totalTokens: 33357,
+          inputTokens: 33227,
+          cachedInputTokens: 2432,
+          outputTokens: 130
+        },
+        last: {
+          inputTokens: 33227,
+          outputTokens: 130
+        },
+        modelContextWindow: 258400
+      }
+    }
+  });
+
+  assert.equal(event.phase, "metering");
+  assert.match(event.message, /in=33227/);
+  assert.match(event.message, /out=130/);
+  assert.match(event.message, /cached=2432/);
+});
+
 test("normalizeNotification: item/started agentMessage with text shows reply preview", () => {
   const event = normalizeNotification(makeState(), {
     method: "item/started",
