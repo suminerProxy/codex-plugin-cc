@@ -257,9 +257,36 @@ function describeStartedItem(state, item) {
     }
     case "webSearch":
       return { message: `Searching: ${shorten(item.query, 96)}`, phase: "investigating" };
+    case "userMessage":
+      return { message: "User input received.", phase: "thinking" };
+    case "assistantMessage":
+    case "agentMessage": {
+      const text = extractItemText(item);
+      return {
+        message: text ? `Codex replying: ${shorten(text, 96)}` : "Codex drafting reply.",
+        phase: "thinking"
+      };
+    }
+    case "reasoning":
+      return { message: "Reasoning.", phase: "thinking" };
     default:
       return null;
   }
+}
+
+function extractItemText(item) {
+  // codex CLI emits item content under several shapes depending on the
+  // version. Try the common ones in priority order; the raw payload is
+  // always preserved in the event record so callers can fall back.
+  if (typeof item?.text === "string") return item.text;
+  if (Array.isArray(item?.content)) {
+    return item.content
+      .map((part) => part?.text || part?.value || "")
+      .join("")
+      .trim();
+  }
+  if (typeof item?.message === "string") return item.message;
+  return "";
 }
 
 function describeCompletedItem(state, item) {
@@ -288,6 +315,18 @@ function describeCompletedItem(state, item) {
     }
     case "exitedReviewMode":
       return { message: "Reviewer finished.", phase: "finalizing" };
+    case "userMessage":
+      return { message: "User input received.", phase: "thinking" };
+    case "assistantMessage":
+    case "agentMessage": {
+      const text = extractItemText(item);
+      return {
+        message: text ? `Codex replied: ${shorten(text, 96)}` : "Codex reply complete.",
+        phase: "thinking"
+      };
+    }
+    case "reasoning":
+      return { message: "Reasoning complete.", phase: "thinking" };
     default:
       return null;
   }
@@ -481,6 +520,195 @@ function recordItem(state, item, lifecycle, threadId = null) {
   }
 }
 
+/**
+ * Map an app-server notification to a flat, append-friendly event record for
+ * the per-job NDJSON event stream (see state.mjs:appendJobEvent). The Claude
+ * main loop polls `/codex:events <job-id>` and reasons over these records —
+ * so the shape must stay stable and self-describing. `seq` is injected by
+ * the appender; this function is pure and does not allocate sequence numbers.
+ */
+export function normalizeNotification(state, message) {
+  const ts = new Date().toISOString();
+  const method = message.method ?? null;
+  const params = message.params ?? {};
+
+  switch (method) {
+    case "thread/started":
+      return {
+        ts,
+        method,
+        threadId: params.thread?.id ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase: "starting",
+        message: `Thread started (${params.thread?.id ?? "?"}).`,
+        raw: params
+      };
+    case "thread/name/updated":
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase: "starting",
+        message: `Thread renamed: ${params.threadName ?? "?"}`,
+        raw: params
+      };
+    case "thread/status/changed": {
+      const statusType = params.status?.type ?? null;
+      let phase = "unknown";
+      let message = `Thread status: ${statusType ?? "?"}`;
+      if (statusType === "active") {
+        phase = "thinking";
+        message = "Thread active.";
+      } else if (statusType === "idle") {
+        // codex flips to idle after a turn completes (post turn/completed).
+        // Treat as completed-side phase so main loop reads it as quiescent.
+        phase = "idle";
+        message = "Thread idle.";
+      } else if (statusType === "systemError") {
+        phase = "failed";
+        message = "Thread system error.";
+      }
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase,
+        message,
+        raw: params
+      };
+    }
+    case "thread/tokenUsage/updated": {
+      // codex streams token usage updates as the turn progresses. P7
+      // top-level surface (runAppServerTurn.usage) reads from
+      // turnState.finalTurn?.usage at turn end; this event source is the
+      // real-time signal main-loop Claude can poll to detect "this turn
+      // is burning a lot of tokens, maybe compact before it overflows."
+      const usage = params.usage ?? params.tokenUsage ?? params ?? {};
+      const inTok = usage.inputTokens ?? usage.input ?? null;
+      const outTok = usage.outputTokens ?? usage.output ?? null;
+      const cachedTok = usage.cachedInputTokens ?? usage.cached ?? null;
+      const parts = [];
+      if (inTok != null) parts.push(`in=${inTok}`);
+      if (outTok != null) parts.push(`out=${outTok}`);
+      if (cachedTok != null) parts.push(`cached=${cachedTok}`);
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase: "metering",
+        message: parts.length > 0 ? `Token usage: ${parts.join(" ")}` : "Token usage updated.",
+        raw: params
+      };
+    }
+    case "warning":
+      // Codex emits these for non-fatal conditions (context budget exceeded,
+      // skipped capabilities, etc.). Surface them so main-loop Claude can
+      // factor them into routing decisions without confusing them with errors.
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase: "warning",
+        message: params.message ? `Warning: ${params.message}` : "Warning notification.",
+        raw: params
+      };
+    case "turn/started":
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: params.turn?.id ?? null,
+        itemType: null,
+        lifecycle: null,
+        phase: "thinking",
+        message: `Turn started (${params.turn?.id ?? "?"}).`,
+        raw: params
+      };
+    case "item/started": {
+      const item = params.item ?? {};
+      const description = describeStartedItem(state, item);
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: state.threadTurnIds.get(params.threadId ?? state.threadId) ?? null,
+        itemType: item.type ?? null,
+        lifecycle: "started",
+        phase: description?.phase ?? "running",
+        message: description?.message ?? `Item started: ${item.type ?? "?"}`,
+        raw: item
+      };
+    }
+    case "item/completed": {
+      const item = params.item ?? {};
+      const description = describeCompletedItem(state, item);
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: state.threadTurnIds.get(params.threadId ?? state.threadId) ?? null,
+        itemType: item.type ?? null,
+        lifecycle: "completed",
+        phase: description?.phase ?? "running",
+        message: description?.message ?? `Item completed: ${item.type ?? "?"}`,
+        raw: item
+      };
+    }
+    case "error":
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: null,
+        itemType: null,
+        lifecycle: null,
+        phase: "failed",
+        message: `Codex error: ${params.error?.message ?? "unknown"}`,
+        raw: params.error ?? null
+      };
+    case "turn/completed": {
+      const turnStatus = params.turn?.status ?? "completed";
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? null,
+        turnId: params.turn?.id ?? null,
+        itemType: null,
+        lifecycle: null,
+        phase: turnStatus === "completed" ? "completed" : "finalizing",
+        message: `Turn ${turnStatus}.`,
+        raw: params.turn ?? null
+      };
+    }
+    default:
+      return {
+        ts,
+        method,
+        threadId: params.threadId ?? params.thread?.id ?? null,
+        turnId: params.turn?.id ?? null,
+        itemType: null,
+        lifecycle: null,
+        phase: "unknown",
+        message: `${method ?? "unknown"} notification`,
+        raw: params
+      };
+  }
+}
+
 function applyTurnNotification(state, message) {
   switch (message.method) {
     case "thread/started":
@@ -553,6 +781,22 @@ function applyTurnNotification(state, message) {
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const { onNotification } = options;
+
+  // Apply notification to state THEN emit normalized event. Order matters:
+  // normalize reads state.threadTurnIds / threadLabels that applyTurnNotification
+  // populates. onNotification errors are swallowed so a broken consumer can't
+  // crash the worker (events are observability, not control flow).
+  const dispatch = (message) => {
+    applyTurnNotification(state, message);
+    if (onNotification) {
+      try {
+        onNotification(normalizeNotification(state, message));
+      } catch {
+        // intentionally ignored
+      }
+    }
+  };
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -561,7 +805,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
+      dispatch(message);
       return;
     }
 
@@ -572,7 +816,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
     }
 
-    applyTurnNotification(state, message);
+    dispatch(message);
   });
 
   try {
@@ -584,7 +828,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
     for (const message of state.bufferedNotifications) {
       if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
+        dispatch(message);
       } else {
         if (previousHandler) {
           previousHandler(message);
@@ -863,6 +1107,68 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
+/**
+ * Trigger codex's protocol-native context compaction on a thread. This is
+ * the recovery path for "prompt too long / context overflow" scenarios:
+ * main-loop Claude calls /codex:compact, then resumes the thread with an
+ * amended prompt via /codex:rescue --resume. Compaction itself runs on
+ * the codex side; this wrapper is fire-and-return — it kicks off the
+ * compact request and returns once the app-server acknowledges it.
+ * Streaming notifications (broker recognizes thread/compact/start as a
+ * STREAMING_METHOD) flow to whoever owns the broker stream at that moment;
+ * if no consumer is active, codex still completes compaction on its side.
+ *
+ * NOTE: the exact shape of the success payload is not documented for
+ * codex CLI 0.131; this returns the raw result alongside the bookkeeping
+ * fields. A typed wrapper in app-server-protocol.d.ts can land once the
+ * shape is observed in a real run.
+ */
+export async function compactAppServerThread(cwd, { threadId }) {
+  if (!threadId) {
+    return {
+      attempted: false,
+      compacted: false,
+      transport: null,
+      result: null,
+      detail: "missing threadId"
+    };
+  }
+
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    return {
+      attempted: false,
+      compacted: false,
+      transport: null,
+      result: null,
+      detail: availability.detail
+    };
+  }
+
+  let client = null;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+    const result = await client.request("thread/compact/start", { threadId });
+    return {
+      attempted: true,
+      compacted: true,
+      transport: client.transport,
+      result,
+      detail: `Compaction started on ${threadId}.`
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      compacted: false,
+      transport: client?.transport ?? null,
+      result: null,
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    await client?.close().catch(() => {});
+  }
+}
+
 export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   if (!threadId || !turnId) {
     return {
@@ -1009,7 +1315,10 @@ export async function runAppServerTurn(cwd, options = {}) {
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
-      { onProgress: options.onProgress }
+      {
+        onProgress: options.onProgress,
+        onNotification: options.onNotification
+      }
     );
 
     return {
@@ -1019,6 +1328,10 @@ export async function runAppServerTurn(cwd, options = {}) {
       finalMessage: turnState.lastAgentMessage,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
+      // Top-level surface so /codex:status and the events stream can read
+      // usage without traversing the nested `turn` object. May be null when
+      // the upstream codex CLI version does not report usage.
+      usage: turnState.finalTurn?.usage ?? null,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
