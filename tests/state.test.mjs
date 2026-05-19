@@ -261,3 +261,57 @@ test("appendJobEvent elides event entirely when even truncated raw is too big", 
   assert.equal(events[0].method, "turn/started");
   assert.equal(events[0].phase, "tool:bash");
 });
+
+test("appendJobEvent strips raw payload when CODEX_EVENTS_RAW=0", () => {
+  const previous = process.env.CODEX_EVENTS_RAW;
+  process.env.CODEX_EVENTS_RAW = "0";
+  try {
+    const workspace = makeTempDir();
+    appendJobEvent(workspace, "job-raw-off", {
+      seq: 0,
+      ts: "2026-01-01T00:00:00.000Z",
+      phase: "thinking",
+      method: "turn/started",
+      raw: { big: "payload", nested: { more: "data" } }
+    });
+
+    const events = readJobEvents(workspace, "job-raw-off");
+    assert.equal(events.length, 1);
+    assert.equal(events[0].raw, null);
+    assert.equal(events[0].method, "turn/started");
+    assert.equal(events[0].phase, "thinking");
+  } finally {
+    if (previous == null) delete process.env.CODEX_EVENTS_RAW;
+    else process.env.CODEX_EVENTS_RAW = previous;
+  }
+});
+
+test("appendJobEvent keeps raw by default (no CODEX_EVENTS_RAW or value != '0')", () => {
+  const previous = process.env.CODEX_EVENTS_RAW;
+  delete process.env.CODEX_EVENTS_RAW;
+  try {
+    const workspace = makeTempDir();
+    appendJobEvent(workspace, "job-raw-default", {
+      seq: 0,
+      ts: "2026-01-01T00:00:00.000Z",
+      phase: "thinking",
+      raw: { kept: true }
+    });
+    const events = readJobEvents(workspace, "job-raw-default");
+    assert.deepEqual(events[0].raw, { kept: true });
+
+    // Also: any non-"0" value keeps raw (only the literal string "0" disables).
+    process.env.CODEX_EVENTS_RAW = "1";
+    appendJobEvent(workspace, "job-raw-default", {
+      seq: 1,
+      ts: "2026-01-01T00:00:01.000Z",
+      phase: "thinking",
+      raw: { still: "here" }
+    });
+    const after = readJobEvents(workspace, "job-raw-default");
+    assert.deepEqual(after[1].raw, { still: "here" });
+  } finally {
+    if (previous == null) delete process.env.CODEX_EVENTS_RAW;
+    else process.env.CODEX_EVENTS_RAW = previous;
+  }
+});

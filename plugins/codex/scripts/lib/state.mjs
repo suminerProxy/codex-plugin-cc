@@ -202,6 +202,13 @@ export function resolveJobEventsFile(cwd, jobId) {
 }
 
 export function appendJobEvent(cwd, jobId, event) {
+  // Opt-out: CODEX_EVENTS_RAW=0 strips the `raw` payload before write. Defaults
+  // to "on" (debug-friendly) — set this for very chatty codex sessions where
+  // the ndjson file would grow too large to comfortably tail.
+  if (process.env.CODEX_EVENTS_RAW === "0" && event && event.raw != null) {
+    event = { ...event, raw: null };
+  }
+
   const eventsFile = resolveJobEventsFile(cwd, jobId);
   let line = `${JSON.stringify(event)}\n`;
 
