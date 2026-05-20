@@ -343,6 +343,29 @@ rl.on("line", (line) => {
           send({ method: "thread/started", params: { thread: { id: reviewThread.id } } });
         }
         const turnId = nextTurnId(state);
+
+        if (BEHAVIOR === "review-on-separate-thread") {
+          // Mirror codex 0.131 inline delivery when review streams on a
+          // distinct reviewThreadId. No turn/completed is emitted on either
+          // thread, and review never produces an agentMessage final_answer.
+          // Without the exitedReviewMode → completeTurn shortcut, captureTurn
+          // would hang waiting on a signal that never arrives.
+          const separateReviewThread = nextThread(state, thread.cwd, true);
+          send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: separateReviewThread.id } });
+          send({ method: "turn/started", params: { threadId: separateReviewThread.id, turn: buildTurn(turnId) } });
+          send({ method: "item/started", params: { threadId: separateReviewThread.id, turnId, item: { type: "enteredReviewMode", id: turnId, review: "current changes" } } });
+          send({ method: "item/completed", params: { threadId: separateReviewThread.id, turnId, item: { type: "exitedReviewMode", id: turnId, review: nativeReviewText(message.params.target) } } });
+          break;
+        }
+
+        if (BEHAVIOR === "review-hang-after-start") {
+          // Respond to review/start with a valid handle, then stay silent.
+          // captureTurn should bail out via the review timeout instead of
+          // waiting indefinitely.
+          send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
+          break;
+        }
+
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
         emitTurnCompleted(reviewThread.id, turnId, [
           {
