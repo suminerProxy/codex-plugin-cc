@@ -157,6 +157,67 @@ test("review renders a no-findings result from app-server review/start", () => {
   assert.match(result.stdout, /No material issues found/);
 });
 
+test("review completes when codex streams review on a separate thread without turn/completed on the source", () => {
+  // Regression: codex 0.131 inline delivery can emit all review notifications
+  // on a distinct reviewThreadId and never send turn/completed on the source
+  // thread. The subagent branch in applyTurnNotification gates completion on
+  // an agentMessage final_answer that review never produces, so captureTurn
+  // would hang indefinitely without treating exitedReviewMode as terminal.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-on-separate-thread");
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const start = Date.now();
+  const result = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 15000
+  });
+  const elapsed = Date.now() - start;
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Reviewed uncommitted changes/);
+  assert.match(result.stdout, /No material issues found/);
+  assert.ok(elapsed < 10000, `review should finish promptly via exitedReviewMode; took ${elapsed}ms`);
+});
+
+test("review fails with a timeout error when codex stops emitting notifications", () => {
+  // Regression: captureTurn previously had no upper bound. If codex (or the
+  // shared app-server) stopped sending notifications after review/start,
+  // `/codex:review --wait` would block forever. CODEX_COMPANION_REVIEW_TIMEOUT_SECONDS
+  // bounds the wait and surfaces a clean failure.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "review-hang-after-start");
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_REVIEW_TIMEOUT_SECONDS: "2" };
+  const start = Date.now();
+  const result = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env,
+    timeout: 15000
+  });
+  const elapsed = Date.now() - start;
+
+  assert.notEqual(result.status, 0, "expected non-zero exit when review times out");
+  assert.ok(elapsed >= 1800, `expected at least the timeout window to elapse; took ${elapsed}ms`);
+  assert.ok(elapsed < 10000, `expected timeout-bounded failure; took ${elapsed}ms`);
+  const combined = `${result.stdout || ""}\n${result.stderr || ""}`;
+  assert.match(combined, /timed out after \d+s/i);
+});
+
 test("task runs when the active provider does not require OpenAI login", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

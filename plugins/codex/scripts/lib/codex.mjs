@@ -487,14 +487,30 @@ function recordItem(state, item, lifecycle, threadId = null) {
 
   if (item.type === "exitedReviewMode") {
     state.reviewText = item.review ?? "";
-    if (lifecycle === "completed" && item.review) {
-      emitLogEvent(state.onProgress, {
-        message: "Review output captured.",
-        stderrMessage: null,
-        phase: "finalizing",
-        logTitle: "Review output",
-        logBody: item.review
-      });
+    if (lifecycle === "completed") {
+      if (item.review) {
+        emitLogEvent(state.onProgress, {
+          message: "Review output captured.",
+          stderrMessage: null,
+          phase: "finalizing",
+          logTitle: "Review output",
+          logBody: item.review
+        });
+      }
+      // Authoritative completion signal for review turns. In inline delivery
+      // codex 0.131 may emit turn/completed on a separate reviewThreadId,
+      // which routes through the subagent branch and gates completion on an
+      // agentMessage final_answer that review never produces — leaving
+      // captureTurn waiting forever. exitedReviewMode is the semantic end-of-
+      // review marker, so resolve completion here even if turn/completed
+      // never arrives on the source thread.
+      completeTurn(
+        state,
+        state.finalTurn ?? {
+          id: state.turnId ?? "review-turn",
+          status: "completed"
+        }
+      );
     }
     return;
   }
@@ -883,10 +899,46 @@ export function applyTurnNotification(state, message) {
   }
 }
 
+function setupTurnTimeout(state, client, timeoutMs) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return null;
+  }
+
+  const handle = setTimeout(() => {
+    if (state.completed) {
+      return;
+    }
+    const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+    const reason = `Codex turn timed out after ${seconds}s without completion.`;
+    if (!state.error) {
+      state.error = { message: reason, code: "TURN_TIMEOUT" };
+    }
+    emitProgress(state.onProgress, reason, "failed");
+    // Best-effort cooperative cancel. The interrupt response may arrive after
+    // we've already resolved the captureTurn caller, so don't await it.
+    if (state.turnId && state.threadId) {
+      client
+        .request("turn/interrupt", {
+          threadId: state.threadId,
+          turnId: state.turnId
+        })
+        .catch(() => {});
+    }
+    completeTurn(state, {
+      id: state.turnId ?? "timed-out-turn",
+      status: "failed",
+      error: { message: reason }
+    });
+  }, timeoutMs);
+  handle.unref?.();
+  return handle;
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
   const { onNotification } = options;
+  const turnTimeoutHandle = setupTurnTimeout(state, client, options.timeoutMs);
 
   // Apply notification to state THEN emit normalized event. Order matters:
   // normalize reads state.threadTurnIds / threadLabels that applyTurnNotification
@@ -948,9 +1000,23 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     return await state.completion;
   } finally {
+    if (turnTimeoutHandle) {
+      clearTimeout(turnTimeoutHandle);
+    }
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
+}
+
+function resolveReviewTimeoutMs() {
+  const raw = Number(process.env.CODEX_COMPANION_REVIEW_TIMEOUT_SECONDS);
+  if (Number.isFinite(raw) && raw >= 0) {
+    // 0 explicitly disables the timeout.
+    return raw * 1000;
+  }
+  // Reviews should finish within minutes; 10 min is a generous default that
+  // still catches indefinite hangs without surprising real-world runs.
+  return 600_000;
 }
 
 async function withAppServer(cwd, fn) {
@@ -1347,6 +1413,7 @@ export async function runAppServerReview(cwd, options = {}) {
         }),
       {
         onProgress: options.onProgress,
+        timeoutMs: options.timeoutMs ?? resolveReviewTimeoutMs(),
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
