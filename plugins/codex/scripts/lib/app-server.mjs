@@ -186,7 +186,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    // codexArgs lets callers (notably the review path) inject `-c key=value`
+    // overrides at the codex CLI layer, so user-defined developer/persistent
+    // instructions and feature flags don't bleed into review turns.
+    const extraArgs = Array.isArray(this.options.codexArgs) ? this.options.codexArgs : [];
+    this.proc = spawn("codex", ["app-server", ...extraArgs], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],

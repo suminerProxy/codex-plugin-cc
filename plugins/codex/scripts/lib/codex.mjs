@@ -1019,18 +1019,19 @@ function resolveReviewTimeoutMs() {
   return 600_000;
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, options = {}) {
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd);
+    client = await CodexAppServerClient.connect(cwd, options);
     const result = await fn(client);
     await client.close();
     return result;
   } catch (error) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
     const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      !options.disableBroker &&
+      ((client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
+        (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED")));
 
     if (client) {
       await client.close().catch(() => {});
@@ -1041,13 +1042,27 @@ async function withAppServer(cwd, fn) {
       throw error;
     }
 
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    const directClient = await CodexAppServerClient.connect(cwd, { ...options, disableBroker: true });
     try {
       return await fn(directClient);
     } finally {
       await directClient.close();
     }
   }
+}
+
+function getReviewCodexArgs() {
+  // Review-mode hygiene: silence user-defined developer/persistent instructions
+  // and the codex feature flags that nudge it toward governance routing, memory
+  // recall, goal expansion, and unsolicited MCP calls. Reviews must stay
+  // focused on the diff. Each `-c key=value` arrives as two argv tokens so the
+  // TOML override survives shell quoting unchanged.
+  return [
+    "-c", "developer_instructions=''",
+    "-c", "persistent_instructions=''",
+    "-c", "features.memories=false",
+    "-c", "features.goals=false"
+  ];
 }
 
 async function startThread(client, cwd, options = {}) {
@@ -1388,7 +1403,16 @@ export async function runAppServerReview(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withAppServer(cwd, async (client) => {
+  // Bypass the shared broker for reviews and start a dedicated codex
+  // app-server with review-mode -c overrides. The broker is reused across
+  // task and review calls, so any user-defined developer_instructions /
+  // persistent_instructions / memory features it inherits at boot would also
+  // leak into review turns. A short-lived dedicated server keeps review
+  // context clean without affecting the long-running broker the task path
+  // relies on.
+  return withAppServer(
+    cwd,
+    async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
@@ -1436,7 +1460,12 @@ export async function runAppServerReview(cwd, options = {}) {
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr)
     };
-  });
+    },
+    {
+      disableBroker: true,
+      codexArgs: getReviewCodexArgs()
+    }
+  );
 }
 
 export async function runAppServerTurn(cwd, options = {}) {

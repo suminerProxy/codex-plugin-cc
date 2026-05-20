@@ -187,6 +187,72 @@ test("review completes when codex streams review on a separate thread without tu
   assert.ok(elapsed < 10000, `review should finish promptly via exitedReviewMode; took ${elapsed}ms`);
 });
 
+test("review path spawns codex app-server with review-mode -c overrides", () => {
+  // Treats user-defined developer_instructions, persistent_instructions, and
+  // codex feature flags (memories, goals) as a context-pollution source for
+  // review turns: they nudge codex toward governance routing and MCP calls
+  // unrelated to the diff. Plugin forces them off at the codex CLI layer so
+  // the review thread always boots clean, regardless of the user's config.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 15000
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(Array.isArray(state.appServerArgs), "fake-codex must record its argv");
+  assert.equal(state.appServerArgs[0], "app-server");
+  const argLine = state.appServerArgs.join(" ");
+  assert.match(argLine, /-c developer_instructions=''/);
+  assert.match(argLine, /-c persistent_instructions=''/);
+  assert.match(argLine, /-c features\.memories=false/);
+  assert.match(argLine, /-c features\.goals=false/);
+});
+
+test("task path does not inject review-mode overrides into codex app-server args", () => {
+  // Mirror of the review-mode override test: confirms the task path still
+  // honors the user's global developer/persistent instructions. The review
+  // hygiene must not bleed into task execution.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "say hi"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 15000
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const history = state.appServerArgHistory || [];
+  assert.ok(history.length > 0, "fake-codex must record at least one boot");
+  for (const args of history) {
+    const argLine = args.join(" ");
+    assert.doesNotMatch(argLine, /developer_instructions=''/, "task path must not silence developer_instructions");
+    assert.doesNotMatch(argLine, /persistent_instructions=''/, "task path must not silence persistent_instructions");
+    assert.doesNotMatch(argLine, /features\.memories=false/, "task path must not disable memories");
+    assert.doesNotMatch(argLine, /features\.goals=false/, "task path must not disable goals");
+  }
+});
+
 test("review fails with a timeout error when codex stops emitting notifications", () => {
   // Regression: captureTurn previously had no upper bound. If codex (or the
   // shared app-server) stopped sending notifications after review/start,
